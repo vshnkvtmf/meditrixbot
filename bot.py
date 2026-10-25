@@ -1,4 +1,4 @@
-import os, re, json, uuid, random, asyncio, sqlite3, time as _t
+import os, re, json, random, asyncio, sqlite3, traceback, time as _t
 from datetime import time
 from zoneinfo import ZoneInfo
 import discord
@@ -15,6 +15,12 @@ PRIZE = 3
 R_MEMBER, R_OWNER = "🏰 Житель королевства", "👑 Владелец"
 R_MOD_OLD = "👨‍💻 Модератор"
 R_MEMBER_OLD = "🏆 Готовится к запуску"
+CREATE_NAME = "🛠 Создать войс"
+# ключ в БД -> имя канала (для самовосстановления настроек)
+KNOWN = {
+    "rules": "👨‍⚖️・правила", "cheat": "🤒・шпаргалка", "daily": "🗞・ежедневник",
+    "flood": "📨・флуд-флудыч", "tech": "❓・тех-поддержка", "create": CREATE_NAME,
+}
 POS, NEG = {"👍", "❤", "🔥", "⭐"}, {"👎", "😡"}
 RANKS = [(400, "🏰 Герцог"), (150, "🛡 Барон"), (50, "⚔ Рыцарь"), (10, "🗡 Оруженосец"), (-10**9, "🌾 Крестьянин")]
 rank = lambda s: next(n for t, n in RANKS if s >= t)
@@ -26,7 +32,7 @@ db.executescript("""
 CREATE TABLE IF NOT EXISTS cfg(g INTEGER, k TEXT, v INTEGER, PRIMARY KEY(g,k));
 CREATE TABLE IF NOT EXISTS rep(g INTEGER, u INTEGER, score INTEGER DEFAULT 0, daily REAL DEFAULT 0, PRIMARY KEY(g,u));
 CREATE TABLE IF NOT EXISTS votes(m INTEGER, r INTEGER, e TEXT, a INTEGER, g INTEGER, d INTEGER, PRIMARY KEY(m,r,e));
-CREATE TABLE IF NOT EXISTS rooms(c INTEGER PRIMARY KEY, g INTEGER, owner INTEGER, public INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rooms(c INTEGER PRIMARY KEY, g INTEGER, owner INTEGER);
 CREATE TABLE IF NOT EXISTS vacancies(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     g INTEGER, ch INTEGER, msg INTEGER,
@@ -36,9 +42,6 @@ CREATE TABLE IF NOT EXISTS applications(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vid INTEGER, uid INTEGER, data TEXT, status TEXT DEFAULT 'pending');
 """)
-try: db.execute("ALTER TABLE rooms ADD COLUMN public INTEGER DEFAULT 0")
-except sqlite3.OperationalError: pass
-db.commit()
 
 def q(sql, *a):
     c = db.execute(sql, a); db.commit(); return c
@@ -56,28 +59,48 @@ def emb(title, desc="", color=GOLD, fields=(), footer=None):
     if footer: e.set_footer(text=footer)
     return e
 
+def chan(g, key):
+    """Канал по ключу из БД; если записи нет — ищет по известному имени и чинит запись."""
+    ch = g.get_channel(cfg(g.id, key) or 0)
+    if ch: return ch
+    name = KNOWN.get(key)
+    if name:
+        ch = discord.utils.get(g.channels, name=name)
+        if ch:
+            setcfg(g.id, key, ch.id)
+            return ch
+    return None
+
+async def get_user(uid):
+    u = bot.get_user(uid)
+    if u: return u
+    try: return await bot.fetch_user(uid)
+    except discord.HTTPException: return None
+
 # ---------- Bot ----------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+intents.voice_states = True
 
 class Bot(commands.Bot):
     async def setup_hook(self):
         self.add_view(VoicePanel())
-        self.add_view(BrowseView())
         for v in q("SELECT id,filled,slots FROM vacancies WHERE active=1").fetchall():
-            full = v["filled"] >= v["slots"]
-            self.add_view(VacancyView(v["id"], full=full))
+            self.add_view(VacancyView(v["id"], full=v["filled"] >= v["slots"]))
         for a in q("SELECT id FROM applications WHERE status='pending'").fetchall():
             self.add_view(ReviewView(a["id"]))
         await self.tree.sync()
         events.start()
+        sweep_rooms.start()
 
 bot = Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 @bot.event
 async def on_ready():
     print("Online:", bot.user)
+    for g in bot.guilds:  # восстановить привязки каналов
+        for k in KNOWN: chan(g, k)
     for r in q("SELECT c FROM rooms").fetchall():
         ch = bot.get_channel(r["c"])
         if not ch: q("DELETE FROM rooms WHERE c=?", r["c"])
@@ -111,7 +134,6 @@ def cheat_embeds(g):
             f"{m('vacancies')} — вакансии\n"
             f"{m('support')} — поддержать проект\n"
             f"{m('screenshots')} — скриншоты\n"
-            f"{m('voice_lobby')} — голосовые комнаты\n"
             f"{m('flood')} — болтовня\n"
             f"{m('tech')} — помощь и баги"),
         (f"🏰 Роль «{R_MEMBER}»", "Выдана всем участникам королевства. Добро пожаловать!")]),
@@ -120,9 +142,9 @@ def cheat_embeds(g):
         ("Команды", "`/tab` — таблица лидеров\n`/profile [участник]` — звание и репутация\n`/daily` — королевская награда раз в 20 часов"),
         ("Звания", "🌾 Крестьянин → 🗡 Оруженосец (10) → ⚔ Рыцарь (50) → 🛡 Барон (150) → 🏰 Герцог (400)")]),
     emb("🎙 ЛИЧНЫЕ КОМНАТЫ", "", BROWN, [
-        ("Как создать", "Зайди в **🛠 Создать войс** — бот сделает скрытую комнату с твоим ником и перенесёт тебя. Пустая комната удаляется сама."),
-        ("Как найти чужую", "В канале **🎙・комнаты** нажми **«Посмотреть комнаты»** — увидишь активные голосовые. Выбери нужную — и ты там!"),
-        ("Панель управления (придёт в ЛС)", "✏️ название · 👥 лимит · 🌐 публикация · 🔒 закрыть/открыть · 🗑 удалить · 👢 выгнать\n`/panel` — прислать панель снова.")]),
+        ("Как создать", "Зайди в **🛠 Создать войс** — бот сделает комнату с твоим ником и перенесёт тебя. Пустая комната удаляется сама."),
+        ("Панель управления (придёт в ЛС)", "✏️ название · 👥 лимит · 🔒 закрыть/открыть · 🙈 скрыть/показать · 👢 выгнать · 🗑 удалить\n`/panel` — прислать панель снова."),
+        ("Что будет, если…", "🔒 закрыть — новые участники не смогут зайти\n🙈 скрыть — комнату не увидят посторонние\n🥶 Бездействие — сюда уходят молчуны через 15 минут")]),
     emb("🎪 КОРОЛЕВСКИЙ ТУРНИР", "", BROWN, [
         ("Когда", "Каждый день в **20:00 МСК**. 10 минут на запись, затем 5 раундов на смекалку и скорость. Победитель получает **+6 репутации**."),
         ("❓ Тех. поддержка", "Создай пост, выбери тег, опиши проблему. Решено? Напиши `/solved` в своём посте."),
@@ -143,13 +165,6 @@ def support_embed():
         f"**Поддержать:** https://dalink.to/disfleqqqs\n{DIV}",
         GOLD, footer="Спасибо, что вы с нами ✦")
 
-FORUMS = {
-    "tech": ([("🐛", "Баг"), ("❓", "Вопрос"), ("🔌", "Подключение"), ("🧩", "Моды и плагины"), ("✅", "Решено")],
-             "Проблемы и вопросы по серверу. Перед созданием поста прочитай закреплённое сообщение.",
-             emb("📌 Как пользоваться техподдержкой",
-                 "1️⃣ Дай посту ясное название\n2️⃣ Выбери тег\n3️⃣ Опиши: что делал, что ожидал, что получил (скриншоты приветствуются)\n4️⃣ Когда решено — напиши `/solved` в посте\n\nНе дублируй темы и будь терпелив — администратор ответит, как только сможет. 🛠")),
-}
-
 # ---------- /reload ----------
 async def post(ch, embeds):
     try: await ch.purge(limit=50, check=lambda m: m.author == bot.user)
@@ -167,15 +182,23 @@ async def reload_cmd(i: discord.Interaction):
     g = i.guild
     errs, info = [], []
 
+    # ===== восстановление привязок =====
+    for k in KNOWN: chan(g, k)
+
     # ===== РОЛИ =====
     old_member = discord.utils.get(g.roles, name=R_MEMBER_OLD)
     new_member = discord.utils.get(g.roles, name=R_MEMBER)
     if new_member:
         info.append(f"🏰 Роль участника «{R_MEMBER}» уже на месте")
         if old_member and old_member.id != new_member.id:
+            moved = 0
+            for m in list(old_member.members):
+                if new_member not in m.roles:
+                    try: await m.add_roles(new_member); moved += 1; await asyncio.sleep(0.3)
+                    except discord.HTTPException: pass
             try:
                 await old_member.delete(reason="Дубликат старой роли")
-                info.append(f"🗑 Удалена старая роль участника «{R_MEMBER_OLD}»")
+                info.append(f"🗑 Удалена старая роль «{R_MEMBER_OLD}» (перенесено участников: {moved})")
             except discord.HTTPException:
                 errs.append("Не удалось удалить старую роль участника.")
     elif old_member:
@@ -214,11 +237,24 @@ async def reload_cmd(i: discord.Interaction):
         return ow
 
     # ===== КАНАЛЫ =====
+    # 0. Войс «Создать войс» (без него личные комнаты не работают)
+    cr = chan(g, "create")
+    if not cr:
+        try:
+            cat = discord.utils.get(g.categories, name="Общение")
+            cr = await g.create_voice_channel(CREATE_NAME, category=cat)
+            setcfg(g.id, "create", cr.id)
+            info.append(f"🎙 Создан канал «{CREATE_NAME}»")
+        except discord.HTTPException as e:
+            errs.append(f"Не удалось создать «{CREATE_NAME}»: {e.text}")
+    else:
+        info.append(f"🎙 Канал «{cr.name}» привязан — личные комнаты работают")
+
     # 1. Ежедневник → «Самое важное»
     sv = discord.utils.get(g.categories, name="Самое важное")
-    daily = g.get_channel(cfg(g.id, "daily") or 0) or discord.utils.get(g.text_channels, name="🗞・ежедневник")
-    if daily and sv and daily.category_id != sv.id:
-        try: await daily.edit(category=sv); info.append("📅 ежедневник → «Самое важное»")
+    daily_ch = chan(g, "daily")
+    if daily_ch and sv and daily_ch.category_id != sv.id:
+        try: await daily_ch.edit(category=sv); info.append("📅 ежедневник → «Самое важное»")
         except discord.HTTPException: errs.append("Не удалось переместить ежедневник.")
 
     # 2. Категория «Minecraft-сервер»
@@ -239,9 +275,10 @@ async def reload_cmd(i: discord.Interaction):
             try: await mc_ch.edit(category=mc_cat)
             except discord.HTTPException: errs.append("Не удалось перенести MC-канал.")
         setcfg(g.id, "news", mc_ch.id)
+        q("DELETE FROM cfg WHERE g=? AND k='mc'", g.id)
         info.append("📰 minecraft-сервер → 📰・новости-сервера")
     else:
-        news = discord.utils.get(g.text_channels, name="📰・новости-сервера")
+        news = g.get_channel(cfg(g.id, "news") or 0) or discord.utils.get(g.text_channels, name="📰・новости-сервера")
         if not news:
             news = await g.create_text_channel("📰・новости-сервера", category=mc_cat, overwrites=ow_readonly())
             info.append("📰 Создан канал новостей сервера")
@@ -297,7 +334,7 @@ async def reload_cmd(i: discord.Interaction):
             except discord.HTTPException: errs.append("Не удалось удалить «Новости».")
 
     # 8. Удалить «идеи-minecraft»
-    ideas_ch = g.get_channel(cfg(g.id, "ideas") or 0) or discord.utils.get(g.forums + g.text_channels, name="💥・идеи-minecraft")
+    ideas_ch = g.get_channel(cfg(g.id, "ideas") or 0) or discord.utils.get(list(g.forums) + list(g.text_channels), name="💥・идеи-minecraft")
     if ideas_ch:
         try:
             await ideas_ch.delete()
@@ -305,53 +342,35 @@ async def reload_cmd(i: discord.Interaction):
             info.append("🗑 Канал «идеи-minecraft» удалён")
         except discord.HTTPException: errs.append("Не удалось удалить «идеи-minecraft».")
 
-    # 9. 🎙・комнаты — панель для просмотра голосовых
-    obsh = discord.utils.get(g.categories, name="Общение")
-    lobby = g.get_channel(cfg(g.id, "voice_lobby") or 0) \
-            or discord.utils.get(g.text_channels, name="🎙・комнаты")
-    if not lobby:
-        lobby = await g.create_text_channel(
-            "🎙・комнаты", category=obsh,
-            overwrites={
-                g.default_role: discord.PermissionOverwrite(
-                    send_messages=False, add_reactions=False, create_public_threads=False),
-                g.me: discord.PermissionOverwrite(
-                    send_messages=True, embed_links=True, manage_messages=True),
-            })
-        info.append("🎙 Создан канал «🎙・комнаты»")
-    elif obsh and lobby.category_id != obsh.id:
-        try: await lobby.edit(category=obsh)
-        except discord.HTTPException: pass
-    setcfg(g.id, "voice_lobby", lobby.id)
+    # 8.5. Удалить канал «🎙・комнаты»
+    lobby = g.get_channel(cfg(g.id, "voice_lobby") or 0) or discord.utils.get(g.text_channels, name="🎙・комнаты")
+    if lobby:
+        try:
+            await lobby.delete()
+            q("DELETE FROM cfg WHERE g=? AND k='voice_lobby'", g.id)
+            info.append("🗑 Канал «🎙・комнаты» удалён")
+        except discord.HTTPException:
+            errs.append("Не удалось удалить канал «🎙・комнаты».")
 
-    # 10. Обновить Устав и Шпаргалку
-    rules_ch = g.get_channel(cfg(g.id, "rules") or 0)
+    # 9. Обновить Устав и Шпаргалку
+    rules_ch = chan(g, "rules")
     if rules_ch:
         try: await post(rules_ch, rules_embeds())
         except discord.HTTPException: errs.append("Не удалось обновить Устав.")
-    cheat_ch = g.get_channel(cfg(g.id, "cheat") or 0)
+    cheat_ch = chan(g, "cheat")
     if cheat_ch:
         try: await post(cheat_ch, cheat_embeds(g))
         except discord.HTTPException: errs.append("Не удалось обновить Шпаргалку.")
 
-    # 11. Пере-пост панели комнат
-    try:
-        await lobby.purge(limit=10, check=lambda m: m.author == bot.user)
-        await lobby.send(
-            embed=emb("🎙 Голосовые комнаты",
-                f"{DIV}\nХочешь пообщаться? Присоединяйся к активной комнате или создай свою!\n{DIV}",
-                BROWN, [
-                ("🎧 Найти комнату", "Нажми **Посмотреть комнаты** — увидишь список активных голосовых."),
-                ("🛠 Создать свою", "Зайди в голосовой канал «🛠 Создать войс» — бот создаст твою комнату."),
-                ("⚙ Управление", "Панель управления придёт в ЛС: название, лимит, публикация."),
-            ]),
-            view=BrowseView())
-    except discord.HTTPException as e:
-        errs.append(f"Не удалось обновить панель комнат: {e}")
+    # 10. Проверка прав бота для войсов
+    p = g.me.guild_permissions
+    miss = [n for n, ok in (("Управление каналами", p.manage_channels), ("Перемещение участников", p.move_members),
+                            ("Подключение", p.connect)) if not (ok or p.administrator)]
+    if miss: errs.append("Для личных комнат боту не хватает прав: " + ", ".join(miss))
 
     txt = "✅ **Изменения применены:**\n" + ("\n".join(f"• {x}" for x in info) or "—")
-    if errs: txt += "\n\n⚠ " + "\n".join(errs)
-    await i.followup.send(txt, ephemeral=True)
+    if errs: txt += "\n\n⚠ " + "\n⚠ ".join(errs)
+    await i.followup.send(txt[:1990], ephemeral=True)
 
 # ---------- Новички ----------
 @bot.event
@@ -375,20 +394,33 @@ async def on_member_join(m: discord.Member):
 # ---------- Личные войсы ----------
 def room_of(i):
     r = q("SELECT c FROM rooms WHERE owner=?", i.user.id).fetchone()
-    return bot.get_channel(r["c"]) if r else None
+    if not r: return None
+    ch = bot.get_channel(r["c"])
+    if not ch:  # канал удалён вручную — чистим запись
+        q("DELETE FROM rooms WHERE c=?", r["c"])
+    return ch
 
 class NameModal(discord.ui.Modal, title="Название комнаты"):
     v = discord.ui.TextInput(label="Новое название", max_length=100)
     def __init__(s, ch): super().__init__(); s.ch = ch
     async def on_submit(s, i):
-        await s.ch.edit(name=s.v.value); await i.response.send_message("✅ Название изменено.", ephemeral=True)
+        name = s.v.value.strip()
+        if not name:
+            return await i.response.send_message("Название не может быть пустым.", ephemeral=True)
+        try: await s.ch.edit(name=name)
+        except discord.HTTPException as e:
+            return await i.response.send_message(f"Не удалось: {e.text}", ephemeral=True)
+        await i.response.send_message("✅ Название изменено.", ephemeral=True)
 
 class LimitModal(discord.ui.Modal, title="Лимит участников"):
     v = discord.ui.TextInput(label="Число от 0 до 99 (0 — без лимита)", max_length=2)
     def __init__(s, ch): super().__init__(); s.ch = ch
     async def on_submit(s, i):
         n = int(s.v.value) if s.v.value.isdigit() else 0
-        await s.ch.edit(user_limit=n); await i.response.send_message(f"✅ Лимит: {n or 'нет'}.", ephemeral=True)
+        try: await s.ch.edit(user_limit=n)
+        except discord.HTTPException as e:
+            return await i.response.send_message(f"Не удалось: {e.text}", ephemeral=True)
+        await i.response.send_message(f"✅ Лимит: {n or 'нет'}.", ephemeral=True)
 
 async def toggle(i, perm, msgs):
     ch = room_of(i); role = ch.guild.default_role
@@ -403,128 +435,75 @@ class VoicePanel(discord.ui.View):
     async def interaction_check(s, i):
         if room_of(i): return True
         await i.response.send_message("У тебя нет комнаты. Зайди в «🛠 Создать войс».", ephemeral=True); return False
-
-    @discord.ui.button(label="Название", emoji="✏️", custom_id="vp:name", row=0)
+    @discord.ui.button(label="Название", emoji="✏️", custom_id="vp:name")
     async def name(s, i, b): await i.response.send_modal(NameModal(room_of(i)))
-
-    @discord.ui.button(label="Лимит", emoji="👥", custom_id="vp:limit", row=0)
+    @discord.ui.button(label="Лимит", emoji="👥", custom_id="vp:limit")
     async def limit(s, i, b): await i.response.send_modal(LimitModal(room_of(i)))
-
-    @discord.ui.button(label="В списке", emoji="🌐", custom_id="vp:publish", row=0)
-    async def publish(s, i, b):
-        ch = room_of(i)
-        r = q("SELECT public FROM rooms WHERE c=?", ch.id).fetchone()
-        new_val = 0 if r["public"] else 1
-        q("UPDATE rooms SET public=? WHERE c=?", new_val, ch.id)
-        if new_val:
-            await i.response.send_message("🌐 Комната теперь видна в «🎙・комнаты»!", ephemeral=True)
-        else:
-            await i.response.send_message("🙈 Комната скрыта из общего списка (ты её по-прежнему видишь).", ephemeral=True)
-
-    @discord.ui.button(label="Закрыть/открыть", emoji="🔒", custom_id="vp:lock", row=1)
+    @discord.ui.button(label="Закрыть/открыть", emoji="🔒", custom_id="vp:lock")
     async def lock(s, i, b): await toggle(i, "connect", ("🔒 Комната закрыта.", "🔓 Комната открыта."))
-
-    @discord.ui.button(label="Удалить", emoji="🗑", style=discord.ButtonStyle.danger, custom_id="vp:del", row=1)
+    @discord.ui.button(label="Скрыть/показать", emoji="🙈", custom_id="vp:hide")
+    async def hide(s, i, b): await toggle(i, "view_channel", ("🙈 Комната скрыта.", "👁 Комната видна."))
+    @discord.ui.button(label="Удалить", emoji="🗑", style=discord.ButtonStyle.danger, custom_id="vp:del")
     async def delete(s, i, b):
         ch = room_of(i); q("DELETE FROM rooms WHERE c=?", ch.id)
-        await i.response.send_message("🗑 Комната удалена.", ephemeral=True); await ch.delete()
-
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="👢 Выгнать участника…", custom_id="vp:kick", row=2)
+        await i.response.send_message("🗑 Комната удалена.", ephemeral=True)
+        try: await ch.delete()
+        except discord.HTTPException: pass
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="👢 Выгнать участника…", custom_id="vp:kick")
     async def kick(s, i, sel):
         ch = room_of(i); mem = ch.guild.get_member(sel.values[0].id)
         if not mem or mem.id == i.user.id or mem not in ch.members:
             return await i.response.send_message("Этого участника нет в твоей комнате.", ephemeral=True)
-        await mem.move_to(None); await ch.set_permissions(mem, connect=False)
+        try:
+            await mem.move_to(None); await ch.set_permissions(mem, connect=False)
+        except discord.HTTPException as e:
+            return await i.response.send_message(f"Не удалось: {e.text}", ephemeral=True)
         await i.response.send_message(f"👢 {mem.display_name} выгнан и не сможет вернуться.", ephemeral=True)
 
 async def send_panel(m, ch):
     try:
-        await m.send(embed=emb("🎙 Твоя комната готова",
-            f"**{ch.name}** — открыта для тебя.\n{DIV}\n"
-            "🌐 **«В списке»** — комната появится в «🎙・комнаты» для всех\n"
-            "🔒 **«Закрыть»** — новые участники не смогут зайти\n"
-            f"{DIV}",
-            BROWN), view=VoicePanel())
+        await m.send(embed=emb("🎙 Твоя комната готова", f"**{ch.name}** — управляй ею кнопками ниже.", BROWN), view=VoicePanel())
         return True
     except discord.HTTPException: return False
 
-# ---------- Просмотр комнат ----------
-class RoomSelect(discord.ui.Select):
-    def __init__(self, rooms):
-        opts = [discord.SelectOption(label=name[:100], value=str(cid)) for cid, name in rooms[:25]]
-        super().__init__(placeholder="Выбери комнату…",
-                         options=opts,
-                         custom_id=f"browse:select:{uuid.uuid4().hex[:8]}")
-    async def callback(self, i: discord.Interaction):
-        ch = i.guild.get_channel(int(self.values[0]))
-        if not ch:
-            return await i.response.send_message("Комната уже закрылась.", ephemeral=True)
-        try:
-            ow = ch.overwrites_for(i.user)
-            ow.view_channel = True
-            ow.connect = True
-            await ch.set_permissions(i.user, overwrite=ow)
-            await i.user.move_to(ch)
-            await i.response.send_message(f"➡️ Ты в комнате **{ch.name}**", ephemeral=True)
-        except discord.HTTPException as e:
-            await i.response.send_message(f"Не удалось присоединиться: {e}", ephemeral=True)
+async def make_room(m, g, category):
+    base = {m: discord.PermissionOverwrite(view_channel=True, connect=True)}
+    try:  # пробуем явно дать боту права в комнате
+        return await g.create_voice_channel(m.display_name[:100], category=category,
+            overwrites={**base, g.me: discord.PermissionOverwrite(
+                view_channel=True, connect=True, manage_channels=True, move_members=True)})
+    except discord.Forbidden:
+        return await g.create_voice_channel(m.display_name[:100], category=category, overwrites=base)
 
-class BrowseView(discord.ui.View):
-    def __init__(s): super().__init__(timeout=None)
-    @discord.ui.button(label="Посмотреть комнаты", emoji="🎙", custom_id="browse:open",
-                       style=discord.ButtonStyle.primary)
-    async def browse(s, i, b):
-        rows = q("SELECT c FROM rooms WHERE g=? AND public=1", i.guild.id).fetchall()
-        rooms = []
-        for r in rows:
-            ch = i.guild.get_channel(r["c"])
-            if ch:
-                count = len(ch.members)
-                limit = ch.user_limit or "∞"
-                rooms.append((ch.id, f"{ch.name} · {count}/{limit}"))
-        if not rooms:
-            return await i.response.send_message(
-                "Сейчас нет активных комнат. Создай свою в канале «🛠 Создать войс»!", ephemeral=True)
-        view = discord.ui.View(timeout=120)
-        view.add_item(RoomSelect(rooms))
-        await i.response.send_message("🎙 **Активные комнаты:**", view=view, ephemeral=True)
-
-# ---------- Обработка голосовых ----------
 @bot.event
 async def on_voice_state_update(m, b, a):
     if m.bot: return
     g = m.guild
-    # Создание комнаты
-    if a.channel and a.channel.id == cfg(g.id, "create"):
-        r = q("SELECT c FROM rooms WHERE owner=? AND g=?", m.id, g.id).fetchone()
-        ch = g.get_channel(r["c"]) if r else None
-        if r and not ch: q("DELETE FROM rooms WHERE c=?", r["c"])
-        if not ch:
-            ch = await g.create_voice_channel(
-                m.display_name[:100],
-                category=a.channel.category,
-                overwrites={
-                    g.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
-                    m: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
-                    g.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
-                })
-            q("INSERT INTO rooms VALUES(?,?,?,1)", ch.id, g.id, m.id)  # public по умолчанию
-            await send_panel(m, ch)
-        try: await m.move_to(ch)
-        except discord.HTTPException: pass
-
-    # Выход из комнаты
-    if b.channel and b.channel != a.channel:
-        owner_row = q("SELECT owner FROM rooms WHERE c=?", b.channel.id).fetchone()
-        if owner_row and owner_row["owner"] != m.id:
-            ow = b.channel.overwrites_for(m)
-            if ow.view_channel is True and ow.connect is True:
-                try: await b.channel.set_permissions(m, overwrite=None)
+    try:
+        create = chan(g, "create")
+        if a.channel and create and a.channel.id == create.id:
+            r = q("SELECT c FROM rooms WHERE owner=? AND g=?", m.id, g.id).fetchone()
+            ch = g.get_channel(r["c"]) if r else None
+            if r and not ch: q("DELETE FROM rooms WHERE c=?", r["c"])
+            if not ch:
+                ch = await make_room(m, g, a.channel.category)
+                q("INSERT OR REPLACE INTO rooms VALUES(?,?,?)", ch.id, g.id, m.id)
+                await send_panel(m, ch)
+            try: await m.move_to(ch)
+            except discord.HTTPException as e:
+                print("voice: не удалось переместить (нужно право «Перемещать участников»):", e)
+                q("DELETE FROM rooms WHERE c=?", ch.id)
+                try: await ch.delete()
                 except discord.HTTPException: pass
-        if not b.channel.members and q("SELECT 1 FROM rooms WHERE c=?", b.channel.id).fetchone():
+                try: await m.send("⚠ Не удалось создать комнату: боту не хватает права «Перемещать участников». Сообщи администратору.")
+                except discord.HTTPException: pass
+        if b.channel and b.channel != a.channel and not b.channel.members \
+                and q("SELECT 1 FROM rooms WHERE c=?", b.channel.id).fetchone():
             q("DELETE FROM rooms WHERE c=?", b.channel.id)
             try: await b.channel.delete()
             except discord.HTTPException: pass
+    except Exception:
+        print("voice error:"); traceback.print_exc()
 
 @bot.tree.command(name="panel", description="Прислать панель управления твоей комнатой")
 @app_commands.guild_only()
@@ -599,10 +578,9 @@ async def solved(i: discord.Interaction):
     t = i.channel
     if not isinstance(t, discord.Thread) or t.parent_id != cfg(i.guild.id, "tech"):
         return await i.response.send_message("Работает только внутри поста техподдержки.", ephemeral=True)
-    if (i.user.id != t.owner_id
-            and not i.user.guild_permissions.administrator
-            and not i.user.guild_permissions.manage_messages
-            and not i.user.guild_permissions.manage_threads):
+    perms = i.user.guild_permissions
+    if (i.user.id != t.owner_id and not perms.administrator
+            and not perms.manage_messages and not perms.manage_threads):
         return await i.response.send_message("Отметить может автор или администратор.", ephemeral=True)
     tag = discord.utils.get(t.parent.available_tags, name="Решено")
     await i.response.send_message("✅ Тема решена и закрыта. Спасибо!")
@@ -633,20 +611,20 @@ class ApplicationModal(discord.ui.Modal):
                 self.vid, i.user.id, json.dumps(data, ensure_ascii=False))
         app_id = cur.lastrowid
         await i.response.send_message("✅ Заявка отправлена! Ожидай ответа.", ephemeral=True)
-        author = bot.get_user(v["author"])
+        author = await get_user(v["author"])
         if author:
             e = emb(f"📋 Заявка: {v['title']}",
                 f"**Кандидат:** {i.user.mention} (`{i.user.name}`)\n"
                 f"**ID:** {i.user.id}\n{DIV}",
                 BROWN, footer=f"Заявка #{app_id}")
             for f, val_ in data.items():
-                e.add_field(name=f, value=(val_[:1000] or "*пусто*"), inline=False)
+                e.add_field(name=f[:256], value=(val_[:1000] or "*пусто*"), inline=False)
             try:
-                dm = author.dm_channel or await author.create_dm()
-                await dm.send(embed=e, view=ReviewView(app_id))
-                bot.add_view(ReviewView(app_id))
+                view = ReviewView(app_id)
+                await author.send(embed=e, view=view)
+                bot.add_view(view)
             except discord.HTTPException:
-                pass
+                print(f"Не удалось отправить заявку #{app_id} автору вакансии (закрыты ЛС?)")
 
 class ApplyBtn(discord.ui.Button):
     def __init__(self, vid, full=False):
@@ -687,6 +665,8 @@ class AcceptBtn(discord.ui.Button):
         v = q("SELECT * FROM vacancies WHERE id=?", app["vid"]).fetchone()
         if not v:
             return await i.response.send_message("Вакансия не найдена.", ephemeral=True)
+        if v["filled"] >= v["slots"]:
+            return await i.response.send_message("Все места уже заняты.", ephemeral=True)
         guild = bot.get_guild(v["g"])
         if not guild:
             return await i.response.send_message("Сервер не найден.", ephemeral=True)
@@ -712,7 +692,7 @@ class AcceptBtn(discord.ui.Button):
                             break
                     await msg.edit(embed=discord.Embed.from_dict(d), view=VacancyView(v["id"], full=full))
             except discord.HTTPException: pass
-        user = bot.get_user(app["uid"])
+        user = await get_user(app["uid"])
         if user:
             try:
                 await user.send(embed=emb("🎉 Поздравляем!",
@@ -732,7 +712,7 @@ class RejectBtn(discord.ui.Button):
             return await i.response.send_message("Заявка уже обработана.", ephemeral=True)
         v = q("SELECT * FROM vacancies WHERE id=?", app["vid"]).fetchone()
         q("UPDATE applications SET status='rejected' WHERE id=?", self.app_id)
-        user = bot.get_user(app["uid"])
+        user = await get_user(app["uid"])
         if user and v:
             try:
                 await user.send(embed=emb("😔 К сожалению…",
@@ -761,10 +741,14 @@ async def vac(i: discord.Interaction, title: str, role_name: str, slots: int, fi
         return await i.response.send_message("Только для администратора.", ephemeral=True)
     if slots < 1 or slots > 100:
         return await i.response.send_message("Число мест от 1 до 100.", ephemeral=True)
+    field_list = [f.strip() for f in fields.split(",") if f.strip()][:5]
+    if not field_list:
+        return await i.response.send_message("Укажи хотя бы одно поле анкеты.", ephemeral=True)
     g = i.guild
     vac_ch = g.get_channel(cfg(g.id, "vacancies") or 0)
     if not vac_ch:
         return await i.response.send_message("Канал вакансий не найден. Запусти /reload.", ephemeral=True)
+    await i.response.defer(ephemeral=True)
 
     mm = re.match(r"<@&(\d+)>", role_name.strip())
     role = g.get_role(int(mm.group(1))) if mm else None
@@ -773,7 +757,7 @@ async def vac(i: discord.Interaction, title: str, role_name: str, slots: int, fi
     if not role:
         try: role = await g.create_role(name=role_name.strip(), hoist=True, colour=discord.Colour(0x4A90D9))
         except discord.HTTPException as e:
-            return await i.response.send_message(f"Не удалось создать роль: {e}", ephemeral=True)
+            return await i.followup.send(f"Не удалось создать роль: {e}", ephemeral=True)
 
     # Скрыть канал вакансий от роли принятых
     try:
@@ -782,10 +766,6 @@ async def vac(i: discord.Interaction, title: str, role_name: str, slots: int, fi
         await vac_ch.set_permissions(role, overwrite=ow)
     except discord.HTTPException: pass
 
-    field_list = [f.strip() for f in fields.split(",") if f.strip()][:5]
-    if not field_list:
-        return await i.response.send_message("Укажи хотя бы одно поле анкеты.", ephemeral=True)
-
     e = emb(f"💼 {title}",
         f"{DIV}\nПрисоединяйся к нашей команде! Заполни анкету, нажав кнопку ниже.\n{DIV}", BROWN)
     e.add_field(name="Роль", value=role.mention, inline=True)
@@ -793,16 +773,15 @@ async def vac(i: discord.Interaction, title: str, role_name: str, slots: int, fi
     e.add_field(name="Поля анкеты", value=", ".join(field_list), inline=False)
 
     cur = q("INSERT INTO vacancies(g,ch,msg,author,role_id,slots,filled,title,fields,active) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            g.id, vac_ch.id, 0, i.user.id, role.id, slots, 0, title, fields, 1)
+            g.id, vac_ch.id, 0, i.user.id, role.id, slots, 0, title, ",".join(field_list), 1)
     vid = cur.lastrowid
     view = VacancyView(vid)
     msg = await vac_ch.send(embed=e, view=view)
     q("UPDATE vacancies SET msg=? WHERE id=?", msg.id, vid)
     bot.add_view(view)
+    await i.followup.send(f"✅ Вакансия создана: {msg.jump_url}", ephemeral=True)
 
-    await i.response.send_message(f"✅ Вакансия создана: {msg.jump_url}", ephemeral=True)
-
-# ---------- Турнир (1 раз в день, 20:00 МСК) ----------
+# ---------- Турнир (1 раз в день, 20:00) ----------
 EVENT_SIGNUP_TIME = 600
 ROUND_TIME = 90
 
@@ -834,25 +813,24 @@ def scr(w):
 def round_math(hard=False):
     if hard:
         a, b, c = random.randint(20, 99), random.randint(20, 99), random.randint(100, 500)
-        return "🧮 Счётная палата", f"**{a} × {b} − {c}**", str(a * b - c), "math"
+        return "🧮 Счётная палата", f"**{a} × {b} − {c}**", str(a * b - c)
     a, b, c = random.randint(5, 15), random.randint(5, 15), random.randint(10, 99)
-    return "🧮 Счётная палата", f"**{a} × {b} + {c}**", str(a * b + c), "math"
+    return "🧮 Счётная палата", f"**{a} × {b} + {c}**", str(a * b + c)
 
 def round_anagram():
     w = random.choice(ANAGRAM_WORDS)
-    return "🔤 Свиток-анаграмма", f"Расшифруй слово: **{scr(w)}**", w, "text"
+    return "🔤 Свиток-анаграмма", f"Расшифруй слово: **{scr(w)}**", w
 
 def round_riddle():
     q_, a = random.choice(RIDDLE_BANK)
-    return "📜 Загадка сфинкса", q_, a, "text"
+    return "📜 Загадка сфинкса", q_, a
 
-async def play_round(ch, gen):
-    title, text, answer, mode = gen
+async def play_round(ch, gen, allowed):
+    title, text, answer = gen
     await ch.send(embed=emb(title, f"{text}\n⏱ {ROUND_TIME} секунд.", BROWN))
     def check(m):
-        if m.channel != ch or m.author.bot: return False
-        txt = m.content.strip().lower()
-        return txt == (answer if mode == "math" else answer.lower())
+        return (m.channel == ch and not m.author.bot and m.author.id in allowed
+                and m.content.strip().lower() == answer.lower())
     try:
         m = await bot.wait_for("message", timeout=ROUND_TIME, check=check)
         return m.author
@@ -863,7 +841,7 @@ class EventSignupView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=EVENT_SIGNUP_TIME)
         self.participants = set()
-    @discord.ui.button(label="Участвовать!", emoji="⚔", style=discord.ButtonStyle.success, custom_id="ev:join")
+    @discord.ui.button(label="Участвовать!", emoji="⚔", style=discord.ButtonStyle.success)
     async def join(self, i: discord.Interaction, b):
         if i.user.bot: return
         if i.user.id in self.participants:
@@ -876,7 +854,7 @@ async def run_event(g):
     try:
         cat = await g.create_category("🎪 Мини-ивент")
         ch = await cat.create_text_channel("🎲・арена")
-        fl = g.get_channel(cfg(g.id, "flood") or 0)
+        fl = chan(g, "flood")
         if fl:
             await fl.send(embed=emb("🏆 КОРОЛЕВСКИЙ ТУРНИР 🏆",
                 f"{DIV}\nЧерез **10 минут** начнётся грандиозный турнир!\n"
@@ -897,14 +875,16 @@ async def run_event(g):
         participants = signup.participants
         if not participants:
             await ch.send(embed=emb("⌛ Турнир отменён", "Никто не записался. Ждём вас в следующий раз!", RED))
+            await asyncio.sleep(15)
             return
 
         if len(participants) == 1:
-            w = g.get_member(list(participants)[0])
+            w = g.get_member(next(iter(participants)))
             if w:
                 addrep(g.id, w.id, PRIZE * 2)
                 await ch.send(embed=emb("🏆 Единственный участник",
                     f"{w.mention} побеждает без боя и получает **+{PRIZE*2}** репутации!", GOLD))
+            await asyncio.sleep(15)
             return
 
         await ch.send(embed=emb("🏆 ТУРНИР НАЧИНАЕТСЯ!",
@@ -912,29 +892,29 @@ async def run_event(g):
         scores = {uid: 0 for uid in participants}
 
         plan = [round_math(False), round_anagram(), round_riddle(), round_math(True), round_anagram()]
-        titles = ["Раунд 1/5", "Раунд 2/5", "Раунд 3/5", "Раунд 4/5", "Раунд 5/5"]
-        for n, (gen, ttl) in enumerate(zip(plan, titles), 1):
-            await ch.send(embed=emb(f"⚔ {ttl}", f"*{gen[0]}*", BROWN))
-            winner = await play_round(ch, gen)
-            if winner and winner.id in scores:
+        for n, gen in enumerate(plan, 1):
+            await ch.send(embed=emb(f"⚔ Раунд {n}/5", f"*{gen[0]}*", BROWN))
+            winner = await play_round(ch, gen, participants)
+            if winner:
                 scores[winner.id] += 1
                 top = ", ".join(f"<@{u}>: {s}" for u, s in sorted(scores.items(), key=lambda kv: -kv[1]) if s)
                 await ch.send(embed=emb("✅ Верно!",
                     f"{winner.mention} получает **+1** очко!\nТекущий счёт: {top}", GOLD))
             else:
-                await ch.send(embed=emb("⌛ Время вышло", "Никто не ответил.", RED))
+                await ch.send(embed=emb("⌛ Время вышло", f"Никто не ответил. Верный ответ: **{gen[2]}**", RED))
             await asyncio.sleep(3)
 
         if not any(scores.values()):
             await ch.send(embed=emb("🏁 Турнир окончен", "Никто не набрал очков. Ждём вас снова!", RED))
+            await asyncio.sleep(15)
             return
 
         top_score = max(scores.values())
         top = [uid for uid, s in scores.items() if s == top_score]
         if len(top) > 1:
             await ch.send(embed=emb("⚡ РАВНЫЙ СЧЁТ!", "Финальная битва — кто первый решит, тот и чемпион!", GOLD))
-            w2 = await play_round(ch, round_math(True))
-            winner = w2 if (w2 and w2.id in scores) else g.get_member(random.choice(top))
+            w2 = await play_round(ch, round_math(True), set(top))
+            winner = w2 if w2 else g.get_member(random.choice(top))
         else:
             winner = g.get_member(top[0])
 
@@ -946,18 +926,30 @@ async def run_event(g):
                     f"<@{u}> — {s}" for u, s in sorted(scores.items(), key=lambda kv: -kv[1])),
                 GOLD, footer="Слава чемпиону! ⚔"))
         await asyncio.sleep(30)
-    except Exception as e:
-        print("event error:", e)
+    except Exception:
+        print("event error:"); traceback.print_exc()
     finally:
         for x in (ch, cat):
             if x:
                 try: await x.delete()
                 except discord.HTTPException: pass
 
+@tasks.loop(seconds=60)
+async def sweep_rooms():
+    now = discord.utils.utcnow()
+    for r in q("SELECT c FROM rooms").fetchall():
+        ch = bot.get_channel(r["c"])
+        if not ch:
+            q("DELETE FROM rooms WHERE c=?", r["c"]); continue
+        if not ch.members and (now - ch.created_at).total_seconds() > 30:
+            q("DELETE FROM rooms WHERE c=?", r["c"])
+            try: await ch.delete()
+            except discord.HTTPException: pass
+
 @tasks.loop(time=[time(20, 0, tzinfo=TZ)])
 async def events():
     for g in bot.guilds:
-        if cfg(g.id, "flood"):
+        if chan(g, "flood"):
             asyncio.create_task(run_event(g))
 
 # ---------- Скриншоты: только изображения ----------
